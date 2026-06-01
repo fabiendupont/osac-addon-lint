@@ -24,7 +24,11 @@ VALID_EVENTS = {
 
 VALID_PHASES = {"pre", "main", "post"}
 
-ROLE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+RESOURCE_ACTION_PATTERN = re.compile(
+    r"^[a-z][a-z0-9_]*\.(pre_create|create|post_create|pre_update|update|post_update|pre_delete|delete|post_delete|signal)\.(pre|main|post)$"
+)
+
+INTERNAL_ROLE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def _load_yaml(path: Path) -> dict | None:
@@ -64,8 +68,21 @@ def _check_galaxy(path: Path) -> list[Finding]:
     return findings
 
 
+def _is_internal_role(role_dir: Path) -> bool:
+    osac_yaml = role_dir / "meta" / "osac.yaml"
+    if not osac_yaml.exists():
+        return False
+    data = _load_yaml(osac_yaml)
+    return bool(data and data.get("internal"))
+
+
+def _is_resource_action_role(role_dir: Path) -> bool:
+    if _is_internal_role(role_dir):
+        return False
+    return bool(RESOURCE_ACTION_PATTERN.match(role_dir.name))
+
+
 def _has_resource_action_roles(path: Path) -> bool:
-    """Check if the collection has any ResourceAction roles."""
     roles_dir = path / "roles"
     if not roles_dir.is_dir():
         return False
@@ -102,27 +119,6 @@ def _check_addon_manifest(path: Path) -> list[Finding]:
     return findings
 
 
-def _is_internal_role(role_dir: Path) -> bool:
-    """A role marked internal: true in meta/osac.yaml is a helper, not a ResourceAction."""
-    osac_yaml = role_dir / "meta" / "osac.yaml"
-    if not osac_yaml.exists():
-        return False
-    data = _load_yaml(osac_yaml)
-    return bool(data and data.get("internal"))
-
-
-def _is_resource_action_role(role_dir: Path) -> bool:
-    """A role is a ResourceAction if it has create/delete/install entry points
-    and is not marked as internal."""
-    if _is_internal_role(role_dir):
-        return False
-    tasks_dir = role_dir / "tasks"
-    if not tasks_dir.is_dir():
-        return False
-    task_files = {f.stem for f in tasks_dir.iterdir() if f.suffix in (".yaml", ".yml")}
-    return bool(task_files & {"create", "delete", "install", "destroy"})
-
-
 def _check_roles(path: Path) -> list[Finding]:
     roles_dir = path / "roles"
     if not roles_dir.is_dir():
@@ -134,20 +130,53 @@ def _check_roles(path: Path) -> list[Finding]:
             continue
 
         role_name = role_dir.name
-        if not ROLE_NAME_PATTERN.match(role_name):
-            findings.append(Finding("naming", "warning", f"Role name '{role_name}' contains non-standard characters", str(role_dir)))
 
-        if _is_resource_action_role(role_dir):
-            findings.extend(_check_role_metadata(role_dir))
-        findings.extend(_check_role_tasks(role_dir))
+        if _is_internal_role(role_dir):
+            if not INTERNAL_ROLE_PATTERN.match(role_name):
+                findings.append(Finding("naming", "warning", f"Internal role '{role_name}' has non-standard name", str(role_dir)))
+            continue
+
+        if RESOURCE_ACTION_PATTERN.match(role_name):
+            findings.extend(_check_resource_action_role(role_dir))
+        elif INTERNAL_ROLE_PATTERN.match(role_name):
+            findings.append(Finding("naming", "warning",
+                f"Role '{role_name}' is not a ResourceAction (<resource>.<event>.<phase>) and not marked internal",
+                str(role_dir)))
+        else:
+            findings.append(Finding("naming", "error",
+                f"Role '{role_name}' does not match any valid naming pattern",
+                str(role_dir)))
 
     return findings
+
+
+def _check_resource_action_role(role_dir: Path) -> list[Finding]:
+    findings = []
+    role_name = role_dir.name
+
+    findings.extend(_check_role_entry_point(role_dir))
+    findings.extend(_check_role_metadata(role_dir))
+
+    return findings
+
+
+def _check_role_entry_point(role_dir: Path) -> list[Finding]:
+    tasks_dir = role_dir / "tasks"
+    if not tasks_dir.is_dir():
+        return [Finding("tasks", "error", f"Role '{role_dir.name}' missing tasks/ directory", str(tasks_dir))]
+
+    main_yml = tasks_dir / "main.yml"
+    main_yaml = tasks_dir / "main.yaml"
+    if not main_yml.exists() and not main_yaml.exists():
+        return [Finding("tasks", "error", f"Role '{role_dir.name}' missing tasks/main.yml entry point", str(tasks_dir))]
+
+    return []
 
 
 def _check_role_metadata(role_dir: Path) -> list[Finding]:
     osac_yaml = role_dir / "meta" / "osac.yaml"
     if not osac_yaml.exists():
-        return [Finding("metadata", "warning", f"Role '{role_dir.name}' missing meta/osac.yaml", str(osac_yaml))]
+        return [Finding("metadata", "error", f"Role '{role_dir.name}' missing meta/osac.yaml", str(osac_yaml))]
 
     data = _load_yaml(osac_yaml)
     if not data:
@@ -158,40 +187,54 @@ def _check_role_metadata(role_dir: Path) -> list[Finding]:
     if "resource_type" not in data:
         findings.append(Finding("metadata", "error", f"Role '{role_dir.name}' missing resource_type in meta/osac.yaml", str(osac_yaml)))
 
-    if "outputs" in data:
-        if not isinstance(data["outputs"], list):
-            findings.append(Finding("metadata", "error", f"Role '{role_dir.name}' outputs must be a list", str(osac_yaml)))
-        else:
-            for output in data["outputs"]:
-                if "name" not in output:
-                    findings.append(Finding("metadata", "error", f"Role '{role_dir.name}' output entry missing 'name'", str(osac_yaml)))
-                if "type" not in output:
-                    findings.append(Finding("metadata", "warning", f"Role '{role_dir.name}' output '{output.get('name', '?')}' missing 'type'", str(osac_yaml)))
-                if "description" not in output:
-                    findings.append(Finding("metadata", "warning", f"Role '{role_dir.name}' output '{output.get('name', '?')}' missing 'description'", str(osac_yaml)))
+    if "event" not in data:
+        findings.append(Finding("metadata", "error", f"Role '{role_dir.name}' missing event in meta/osac.yaml", str(osac_yaml)))
+    elif data["event"].lower() not in VALID_EVENTS:
+        findings.append(Finding("metadata", "error",
+            f"Role '{role_dir.name}' has invalid event '{data['event']}' (valid: {', '.join(sorted(VALID_EVENTS))})",
+            str(osac_yaml)))
 
-    if "parameters" in data:
-        if not isinstance(data["parameters"], list):
-            findings.append(Finding("metadata", "error", f"Role '{role_dir.name}' parameters must be a list", str(osac_yaml)))
-        else:
-            for param in data["parameters"]:
-                if "name" not in param:
-                    findings.append(Finding("metadata", "error", f"Role '{role_dir.name}' parameter entry missing 'name'", str(osac_yaml)))
-                if "type" not in param:
-                    findings.append(Finding("metadata", "warning", f"Role '{role_dir.name}' parameter '{param.get('name', '?')}' missing 'type'", str(osac_yaml)))
+    if "phase" not in data:
+        findings.append(Finding("metadata", "error", f"Role '{role_dir.name}' missing phase in meta/osac.yaml", str(osac_yaml)))
+    elif data["phase"].lower() not in VALID_PHASES:
+        findings.append(Finding("metadata", "error",
+            f"Role '{role_dir.name}' has invalid phase '{data['phase']}' (valid: {', '.join(sorted(VALID_PHASES))})",
+            str(osac_yaml)))
 
-    return findings
+    parts = role_dir.name.split(".")
+    if len(parts) == 3 and "event" in data and "phase" in data:
+        expected_event = parts[1]
+        expected_phase = parts[2]
+        if data["event"].lower() != expected_event:
+            findings.append(Finding("metadata", "error",
+                f"Role '{role_dir.name}' event '{data['event']}' does not match directory name segment '{expected_event}'",
+                str(osac_yaml)))
+        if data["phase"].lower() != expected_phase:
+            findings.append(Finding("metadata", "error",
+                f"Role '{role_dir.name}' phase '{data['phase']}' does not match directory name segment '{expected_phase}'",
+                str(osac_yaml)))
 
+    if "event" in data and data["event"].lower() == "create":
+        if "outputs" not in data or not data["outputs"]:
+            findings.append(Finding("metadata", "warning",
+                f"Role '{role_dir.name}' is a Create action but declares no outputs",
+                str(osac_yaml)))
 
-def _check_role_tasks(role_dir: Path) -> list[Finding]:
-    tasks_dir = role_dir / "tasks"
-    if not tasks_dir.is_dir():
-        return [Finding("tasks", "error", f"Role '{role_dir.name}' missing tasks/ directory", str(tasks_dir))]
+    if "outputs" in data and isinstance(data["outputs"], list):
+        for output in data["outputs"]:
+            if "name" not in output:
+                findings.append(Finding("metadata", "error", f"Role '{role_dir.name}' output entry missing 'name'", str(osac_yaml)))
+            if "type" not in output:
+                findings.append(Finding("metadata", "warning", f"Role '{role_dir.name}' output '{output.get('name', '?')}' missing 'type'", str(osac_yaml)))
+            if "description" not in output:
+                findings.append(Finding("metadata", "warning", f"Role '{role_dir.name}' output '{output.get('name', '?')}' missing 'description'", str(osac_yaml)))
 
-    findings = []
-    task_files = list(tasks_dir.glob("*.yaml")) + list(tasks_dir.glob("*.yml"))
-    if not task_files:
-        findings.append(Finding("tasks", "error", f"Role '{role_dir.name}' has no task files", str(tasks_dir)))
+    if "parameters" in data and isinstance(data["parameters"], list):
+        for param in data["parameters"]:
+            if "name" not in param:
+                findings.append(Finding("metadata", "error", f"Role '{role_dir.name}' parameter entry missing 'name'", str(osac_yaml)))
+            if "type" not in param:
+                findings.append(Finding("metadata", "warning", f"Role '{role_dir.name}' parameter '{param.get('name', '?')}' missing 'type'", str(osac_yaml)))
 
     return findings
 
@@ -220,11 +263,9 @@ def _check_playbooks(path: Path) -> list[Finding]:
         findings.append(Finding("playbooks", "warning", "delete.yml exists without matching create.yml", str(playbooks_dir)))
 
     for pb in playbook_files:
-        data = _load_yaml(pb)
-        if data:
-            content = pb.read_text()
-            if "ansible_eda" in content:
-                findings.append(Finding("eda", "warning", f"Playbook references ansible_eda (legacy EDA pattern)", str(pb)))
+        content = pb.read_text()
+        if "ansible_eda" in content:
+            findings.append(Finding("eda", "warning", f"Playbook references ansible_eda (legacy EDA pattern)", str(pb)))
 
     return findings
 
@@ -235,28 +276,29 @@ def _check_rollback_completeness(path: Path) -> list[Finding]:
         return []
 
     findings = []
-    roles_with_create = set()
-    roles_with_delete = set()
+    resources_with_create = set()
+    resources_with_delete = set()
 
     for role_dir in roles_dir.iterdir():
-        if not role_dir.is_dir():
-            continue
-        tasks_dir = role_dir / "tasks"
-        if not tasks_dir.is_dir():
+        if not role_dir.is_dir() or not _is_resource_action_role(role_dir):
             continue
 
-        task_files = {f.stem for f in tasks_dir.iterdir() if f.suffix in (".yaml", ".yml")}
-        if "create" in task_files or "install" in task_files:
-            roles_with_create.add(role_dir.name)
-        if "delete" in task_files or "destroy" in task_files:
-            roles_with_delete.add(role_dir.name)
+        parts = role_dir.name.split(".")
+        if len(parts) != 3:
+            continue
 
-    missing_delete = roles_with_create - roles_with_delete
-    for role_name in sorted(missing_delete):
+        resource, event, phase = parts
+        if event == "create" and phase == "main":
+            resources_with_create.add(resource)
+        elif event == "delete" and phase == "main":
+            resources_with_delete.add(resource)
+
+    missing_delete = resources_with_create - resources_with_delete
+    for resource_name in sorted(missing_delete):
         findings.append(Finding(
             "rollback", "warning",
-            f"Role '{role_name}' has create but no matching delete (rollback incomplete)",
-            str(roles_dir / role_name),
+            f"Resource '{resource_name}' has create.main but no matching delete.main (rollback incomplete)",
+            str(roles_dir),
         ))
 
     return findings
